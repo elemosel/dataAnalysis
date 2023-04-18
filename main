@@ -1,0 +1,322 @@
+import os
+import csv
+import pandas as pd
+import datetime
+import openai
+import re
+import json
+
+dictRegex = r"\{\s*[^\{\}]*\s*\}"
+
+# Directory containing the CSV files
+csv_dir = "C:/Users/elemo/Desktop/VS Code Projekte/Python Apps/Customer Projects/Axoko Studios/AxokoStudiosData/All"
+
+# Get a list of all CSV files in the directory
+csv_files = [f for f in os.listdir(csv_dir) if f.endswith('.csv')]
+
+# Create an empty list to store the DataFrames
+dfs = []
+
+# Loop through the CSV files and read them into DataFrames
+for csv_file in csv_files:
+    # Read the CSV file into a DataFrame
+    df = pd.read_csv(os.path.join(csv_dir, csv_file))
+    
+    # Append the DataFrame to the list
+    dfs.append(df)
+
+df = pd.concat(dfs, ignore_index=True)
+
+#sets the row width to max 40 chars each
+pd.set_option('display.max_colwidth', 10)
+
+#! please change accordingly if customer wants other NaN value
+nanReplace = ""
+
+pause = "-------------------------"
+error = "#########################"
+
+#AI preperations
+current_date = datetime.date.today().strftime('%Y-%m-%d')
+cutoff_date = "2021-09-01"
+
+openaiToken = "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"
+
+phoneRegex = "^(?:\\+49|0|\(?\\+49\)?\\s?|\(?0)[1-9](?:[-/.\s]?\d{2,3}){3}$"
+
+#! Replace Anstellungsart with pattern
+#replace all the empty anstellungsarten
+#pattern of all employment stati
+
+emplPattern = ['Vollzeit', 'Teilzeit', 'Freie Mitarbeit', 'Ausbildung', 'Praktikum', 'Befristet', 'Minijob', 'Festanstellung']
+
+anstPattern = ["Stellenbeschreibung", "Anstellungsart"]
+anst_regex = re.compile('|'.join(anstPattern))
+
+emptyVals = ['n/a', 'None', 'unbekannt', 'Unbekannt', 'Nicht vorhanden', "N/A", "Nicht angegeben", 
+             "<Keine Information vorhanden>", "Nicht verfügbar", "keine Email vorhanden", ]
+empty_reg = re.compile("|".join(emptyVals))
+
+plz_reg = re.compile("\d{5}")
+
+#!Methods
+def randText(df, patterns: list, sampleSize: int, returnAltVal: bool):
+    dfSample = df.sample(n=sampleSize)
+    print(dfSample.head())
+    rowTexts = set()
+    
+    for index, row in dfSample.iterrows():
+        for pattern in patterns:
+            if pattern in row["Text"] and not returnAltVal:
+                rowTexts.add(row["Text"])
+            elif returnAltVal:
+                rowTexts.add(row["Text"])
+                
+    return list(rowTexts)
+
+def iterDF(df):
+     for index, x in df.iterrows():
+        match = re.search(plz_reg, x["Ort"])
+        
+        if match:
+            Ort = match.group()
+            df.loc[index, "Ort"] = plz_reg.sub('', df.loc[index, "Ort"])
+            df.loc[index, "PLZ"] = Ort
+
+        if pd.isna(x["Anstellungsart"]):
+            for pattern in emplPattern:
+                if pattern in x["Titel"] or pattern in x["Text"]:
+                    df.loc[index, "Anstellungsart"] = pattern
+                    #print(df.loc[index, "Anstellungsart"])
+                    
+        elif any(pattern in df.loc[index, "Anstellungsart"] for pattern in anstPattern):
+            df.loc[index, "Anstellungsart"] = anst_regex.sub('', df.loc[index, "Anstellungsart"]).replace("\n", " ")
+            #print(df.loc[index, "Anstellungsart"])
+    
+        print(pause)
+        prompt = aiChat(f"""Basierend auf dem folgendem Text, return den Vornamen, den Nachnamen, die Position des Ansprechpartners, die Email, 
+                    die Telefonnummer und die Anrede des Ansprechpartners als ein Python Dictionary in json Format. Falls du keinen 
+                    Ansprechpartner finden kannst, return "None": {x["Text"]}""")
+        
+        result = dictCheck(prompt)
+        
+        if result is not None:
+            if "None" not in result:              
+                try:
+                    for key, value in result.items():
+                        if value != "None" or None: 
+                            try:
+                                if "Vorname" in key:
+                                    if any(pattern not in value for pattern in emptyVals):
+                                        df.loc[index, "Vorname"] = str(value)
+                                    
+                                elif "Nachname" in key:
+                                    if any(pattern not in value for pattern in emptyVals):
+                                        df.loc[index, "Nachname"] = str(value)
+                                        
+                                elif "Position" in key:
+                                    if any(pattern not in value for pattern in emptyVals):
+                                        df.loc[index, "Position"] = str(value)
+                                    
+                                elif "Email" in key:
+                                    if any(pattern not in value for pattern in emptyVals):
+                                        df.loc[index, "Email"] = str(value)
+                                        
+                                elif "Anrede" in key:
+                                    if any(pattern not in value for pattern in emptyVals):
+                                        match = re.search(r"(Herr|Frau)\b", value)
+                                        
+                                        if match:
+                                            gender = match.group(1)
+                                            df.loc[index, "Anrede"] = str(gender)
+                                        
+                                        
+                                elif "Telefonnummer" in key:
+                                    if any(pattern not in value for pattern in emptyVals):
+                                        df.loc[index, "Telefonnummer"] = str(value)
+                                    
+                            except Exception as e:
+                                print(error)
+                                print("There was an error with the dictionary recognition")
+                                print(e)
+                                
+                except Exception as e:
+                    print(error)
+                    print("There was an error when detacting if it is a dict or not")
+                    print(e)
+                    
+                finally: 
+                    #!prints the current update of the row
+                    print(pause)
+                    print("The current row contains:")
+                    print(df.loc[index])
+                               
+
+def aiChat(prompt: str):
+    try: 
+        message = openai.ChatCompletion.create(model="gpt-3.5-turbo", api_key=openaiToken, messages = 
+                                                    [{"role": "system", "content" : f"""You are ChatGPT, a large language model trained by OpenAI. Answer as concisely as possible.
+                                                    Knowledge cutoff: {cutoff_date} Current date: {current_date}"""},
+                                                    {"role": "user", "content" : prompt}]
+                                                )
+
+        return message["choices"][0]["message"]["content"]
+    
+    except Exception as e:
+        print(error)
+        print("There was an error trying to catch OpenAI response, most probably caused by to many tokens")
+        print(e)
+
+def dictCheck(prompt):
+    dictAP = {}
+    if isinstance(prompt, str):
+        if prompt == "None":
+            print("No contact Person found")
+            return None
+                   
+        elif prompt != "None":
+            if any(pattern in prompt for pattern in dictRegex):
+
+                print("Have a Dict hit")
+                try:
+                    dictAP = json.loads(prompt)
+                    #! print(dictAP)
+                    print("Found contact person")
+                    return dictAP
+                
+                except Exception as e:
+                    print(error)
+                    print("There was an error trying to decode the received message from chatgpt")
+                    print(prompt)
+                
+                    return None
+                
+
+            else:    
+                print("No contact Person found")
+                return None
+                
+        
+    elif isinstance(prompt, dict):
+        print("Found a dict")
+        try: 
+            dictAP = json.loads(prompt)
+            print(dictAP)
+            print("Found contact person as a dict")
+            return dictAP
+        
+        except Exception as e: 
+            print(e)
+            
+
+    
+    elif prompt is None:
+        print("No contact Person found")
+        return None
+    
+
+
+print(pause)
+print("Before Datacelanup: ")
+print(f"Shape of dataframe: {df.shape}")
+print(f"Columns of dataframe: {df.columns}")
+print("\n")
+
+#starting the Data cleanup:
+
+#! Duplicate removal:
+df = df.drop_duplicates()
+
+print(pause)
+print("After Replacement Datacelanup: ")
+print(f"Shape of dataframe: {df.shape}")
+print(f"Columns of dataframe: {df.columns}")
+print("\n")
+
+
+#! Merge Unternehmen
+#merge both unternehmen and unternehmen2 zusammen
+df['UnternehmenTotal'] = pd.concat([df['Unternehmen'], df['Unternehmen2']]).reset_index(drop=True)
+
+#drop "unternehmen" auf der columns axis (axis=1)
+df = df.drop(["Unternehmen", "Unternehmen2"], axis=1)
+
+#view the new head with concated data
+print("Head of UnternehmenTotal: ")
+print(f"Columns of dataframe: {df.columns}")
+print(df.head())
+print(df.sample(n=10))
+
+print(pause)
+print("All Null Values before nulls get removes: ")
+print(df.isnull().sum())
+
+#! Drop null Titles
+#Drop all values where Titel is null 
+df.dropna(subset=["Titel"], inplace=True)
+
+#! Drop null Texts
+#drop all values where the Text is null
+df.dropna(subset=["Text"], inplace=True)
+
+print(pause)
+print("All Null Values Step 1: ")
+print(df.isnull().sum())
+
+
+#! Ort fill NaN values with "Unbekannt"
+df["Ort"].fillna(value=nanReplace, inplace=True)
+
+print(pause)
+print("All Null Values Step 2: ")
+print(df.isnull().sum())
+
+
+#! UnternehmenTotal fill NaN values with "Unbekannt"
+#replace all Unternehmen that are not known with "unbekannt"
+df["UnternehmenTotal"].fillna(nanReplace, inplace=True)
+df = df.rename(columns={'UnternehmenTotal': "Unternehmen"})
+
+print(pause)
+print("All Null Values Step 3: ")
+print(df.isnull().sum())
+
+print(pause)
+print("All Null Values Step 4: ")
+print(df.isnull().sum())
+
+print(df.sample(n=10))
+
+#!collect random text of the data
+# print(pause)
+# print("All Texts that contain 'Ansprechpart'")
+# randTexts = randText(df, ["Ansprechpartner","Ansprechpartnerin"], 5, True)
+# print(f"Length of randTexts: {len(randTexts)}")
+
+#!create new columns in the df
+df["Anrede"] = None
+df["Vorname"] = None
+df["Nachname"] = None
+df["Position"] = None
+df["Email"] = None
+df["Telefonnummer"] = None
+df.insert(loc=1, column="PLZ", value=None)
+print("New columns created")
+
+
+#df = df.drop(df.index[10:])
+
+iterDF(df=df)
+
+print(pause)
+print("After iteration:")
+print(df.head(10))
+
+
+file_name = 'Axoko_Studios_Leads_Parse_17042023.xlsx'
+savePath = "C:/Users/elemo/Desktop/VS Code Projekte/Python Apps/Customer Projects/Axoko Studios/AxokoStudiosData/Exports"
+
+savePath = os.path.join(savePath, file_name)
+
+# write the DataFrame to a CSV file
+df.to_excel(savePath, index=False)
